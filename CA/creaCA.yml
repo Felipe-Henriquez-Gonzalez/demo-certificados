@@ -1,0 +1,775 @@
+---
+- name: Crear PKI interna para ansible.demo.com
+  hosts: ca_servers
+  become: true
+  gather_facts: true
+
+  vars:
+
+    # ==========================================================
+    # CONFIGURACION GENERAL
+    # ==========================================================
+
+    ca_domain: "ansible.demo.com"
+
+    ca_base_dir: "/etc/pki/ansible-ca"
+
+    root_ca_dir: "{{ ca_base_dir }}/root"
+    intermediate_ca_dir: "{{ ca_base_dir }}/intermediate"
+
+    root_ca_common_name: "Ansible Demo Root CA"
+    intermediate_ca_common_name: "Ansible Demo Issuing CA"
+
+    country: "CL"
+    state: "Santiago"
+    locality: "Santiago"
+    organization: "Ansible Demo"
+    organizational_unit: "Infrastructure"
+
+    # ==========================================================
+    # DURACION
+    # ==========================================================
+
+    # Root CA: 10 años
+    root_ca_days: 3650
+
+    # Intermediate CA: 5 años
+    intermediate_ca_days: 1825
+
+    # Certificados emitidos: 1 año
+    certificate_days: 365
+
+    # CRL
+    crl_days: 30
+
+    # ==========================================================
+    # CLAVES
+    # ==========================================================
+
+    root_key_size: 4096
+    intermediate_key_size: 4096
+
+    # IMPORTANTE:
+    # guardar estas variables usando Ansible Vault o
+    # Credential de AAP.
+    #
+    # Ejemplo:
+    #
+    # ansible-vault encrypt_string 'PasswordSeguro' \
+    #   --name 'root_ca_passphrase'
+    #
+    root_ca_passphrase: "{{ vault_root_ca_passphrase }}"
+    intermediate_ca_passphrase: "{{ vault_intermediate_ca_passphrase }}"
+
+    # ==========================================================
+    # REPOSITORIOS
+    # ==========================================================
+
+    enable_redhat_repositories: true
+
+    rhel10_repositories:
+      x86_64:
+        - rhel-10-for-x86_64-baseos-rpms
+        - rhel-10-for-x86_64-appstream-rpms
+
+      aarch64:
+        - rhel-10-for-aarch64-baseos-rpms
+        - rhel-10-for-aarch64-appstream-rpms
+
+      ppc64le:
+        - rhel-10-for-ppc64le-baseos-rpms
+        - rhel-10-for-ppc64le-appstream-rpms
+
+      s390x:
+        - rhel-10-for-s390x-baseos-rpms
+        - rhel-10-for-s390x-appstream-rpms
+
+
+  tasks:
+
+    # ==========================================================
+    # VALIDACIONES
+    # ==========================================================
+
+    - name: Validar que el sistema sea Red Hat Enterprise Linux
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "RedHat"
+        fail_msg: "Este playbook requiere Red Hat Enterprise Linux."
+
+    - name: Validar RHEL 10
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution_major_version == "10"
+        fail_msg: >
+          Este playbook fue diseñado específicamente para RHEL 10.
+          Sistema detectado:
+          {{ ansible_distribution }}
+          {{ ansible_distribution_version }}
+
+    - name: Mostrar plataforma detectada
+      ansible.builtin.debug:
+        msg:
+          - "Sistema: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Arquitectura: {{ ansible_architecture }}"
+          - "Dominio PKI: {{ ca_domain }}"
+
+
+    # ==========================================================
+    # REPOSITORIOS
+    # ==========================================================
+
+    - name: Validar arquitectura soportada
+      ansible.builtin.assert:
+        that:
+          - ansible_architecture in rhel10_repositories
+        fail_msg: >
+          Arquitectura {{ ansible_architecture }}
+          no definida en rhel10_repositories.
+      when: enable_redhat_repositories | bool
+
+    - name: Habilitar repositorios RHEL 10 necesarios
+      ansible.builtin.command:
+        argv:
+          - subscription-manager
+          - repos
+          - "--enable={{ item }}"
+      loop: "{{ rhel10_repositories[ansible_architecture] }}"
+      register: repo_enable
+      changed_when: >
+        'enabled' in repo_enable.stdout | lower
+      when: enable_redhat_repositories | bool
+
+    - name: Mostrar repositorios habilitados
+      ansible.builtin.command:
+        cmd: dnf repolist
+      register: enabled_repos
+      changed_when: false
+
+    - name: Mostrar repositorios disponibles
+      ansible.builtin.debug:
+        var: enabled_repos.stdout_lines
+
+
+    # ==========================================================
+    # INSTALACION SOFTWARE
+    # ==========================================================
+
+    - name: Instalar paquetes necesarios para la CA
+      ansible.builtin.dnf:
+        name:
+          - openssl
+          - openssl-libs
+          - ca-certificates
+          - crypto-policies
+          - policycoreutils
+        state: present
+
+
+    # ==========================================================
+    # ESTRUCTURA ROOT CA
+    # ==========================================================
+
+    - name: Crear directorios principales de la Root CA
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+
+        - path: "{{ root_ca_dir }}"
+          mode: "0750"
+
+        - path: "{{ root_ca_dir }}/certs"
+          mode: "0755"
+
+        - path: "{{ root_ca_dir }}/crl"
+          mode: "0755"
+
+        - path: "{{ root_ca_dir }}/newcerts"
+          mode: "0755"
+
+        - path: "{{ root_ca_dir }}/private"
+          mode: "0700"
+
+        - path: "{{ root_ca_dir }}/csr"
+          mode: "0750"
+
+
+    # ==========================================================
+    # ESTRUCTURA INTERMEDIATE CA
+    # ==========================================================
+
+    - name: Crear directorios de la Issuing CA
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+
+        - path: "{{ intermediate_ca_dir }}"
+          mode: "0750"
+
+        - path: "{{ intermediate_ca_dir }}/certs"
+          mode: "0755"
+
+        - path: "{{ intermediate_ca_dir }}/crl"
+          mode: "0755"
+
+        - path: "{{ intermediate_ca_dir }}/csr"
+          mode: "0750"
+
+        - path: "{{ intermediate_ca_dir }}/newcerts"
+          mode: "0755"
+
+        - path: "{{ intermediate_ca_dir }}/private"
+          mode: "0700"
+
+        - path: "{{ intermediate_ca_dir }}/issued"
+          mode: "0750"
+
+
+    # ==========================================================
+    # BASE DATOS ROOT
+    # ==========================================================
+
+    - name: Crear index Root CA
+      ansible.builtin.copy:
+        content: ""
+        dest: "{{ root_ca_dir }}/index.txt"
+        force: false
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Crear serial Root CA
+      ansible.builtin.copy:
+        content: "1000\n"
+        dest: "{{ root_ca_dir }}/serial"
+        force: false
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Crear CRL number Root CA
+      ansible.builtin.copy:
+        content: "1000\n"
+        dest: "{{ root_ca_dir }}/crlnumber"
+        force: false
+        owner: root
+        group: root
+        mode: "0644"
+
+
+    # ==========================================================
+    # BASE DATOS INTERMEDIATE
+    # ==========================================================
+
+    - name: Crear index Intermediate CA
+      ansible.builtin.copy:
+        content: ""
+        dest: "{{ intermediate_ca_dir }}/index.txt"
+        force: false
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Crear serial Intermediate CA
+      ansible.builtin.copy:
+        content: "1000\n"
+        dest: "{{ intermediate_ca_dir }}/serial"
+        force: false
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Crear CRL number Intermediate CA
+      ansible.builtin.copy:
+        content: "1000\n"
+        dest: "{{ intermediate_ca_dir }}/crlnumber"
+        force: false
+        owner: root
+        group: root
+        mode: "0644"
+
+
+    # ==========================================================
+    # CONFIGURACION ROOT CA
+    # ==========================================================
+
+    - name: Crear configuracion OpenSSL Root CA
+      ansible.builtin.copy:
+        dest: "{{ root_ca_dir }}/openssl.cnf"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          [ ca ]
+          default_ca = CA_default
+
+          [ CA_default ]
+
+          dir               = {{ root_ca_dir }}
+
+          certs             = $dir/certs
+          crl_dir           = $dir/crl
+          new_certs_dir     = $dir/newcerts
+
+          database          = $dir/index.txt
+          serial            = $dir/serial
+          crlnumber         = $dir/crlnumber
+
+          certificate       = $dir/certs/ca.cert.pem
+          private_key       = $dir/private/ca.key.pem
+
+          default_md        = sha256
+
+          default_days      = {{ certificate_days }}
+          default_crl_days  = {{ crl_days }}
+
+          policy            = policy_strict
+
+          unique_subject    = no
+
+          copy_extensions   = copy
+
+          [ policy_strict ]
+
+          countryName             = match
+          stateOrProvinceName     = optional
+          localityName            = optional
+          organizationName        = match
+          organizationalUnitName  = optional
+          commonName              = supplied
+
+          [ req ]
+
+          default_bits        = {{ root_key_size }}
+          distinguished_name  = req_distinguished_name
+          string_mask         = utf8only
+          default_md          = sha256
+
+          x509_extensions     = v3_ca
+
+          prompt              = no
+
+          [ req_distinguished_name ]
+
+          C  = {{ country }}
+          ST = {{ state }}
+          L  = {{ locality }}
+          O  = {{ organization }}
+          OU = PKI
+          CN = {{ root_ca_common_name }}
+
+          [ v3_ca ]
+
+          subjectKeyIdentifier   = hash
+          authorityKeyIdentifier = keyid:always,issuer
+
+          basicConstraints = critical, CA:true
+
+          keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+
+          [ v3_intermediate_ca ]
+
+          subjectKeyIdentifier   = hash
+          authorityKeyIdentifier = keyid:always,issuer
+
+          basicConstraints = critical, CA:true, pathlen:0
+
+          keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+
+
+    # ==========================================================
+    # ROOT PRIVATE KEY
+    # ==========================================================
+
+    - name: Generar private key Root CA
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - genpkey
+          - -algorithm
+          - RSA
+          - -aes-256-cbc
+          - -pass
+          - "pass:{{ root_ca_passphrase }}"
+          - -pkeyopt
+          - "rsa_keygen_bits:{{ root_key_size }}"
+          - -out
+          - "{{ root_ca_dir }}/private/ca.key.pem"
+        creates: "{{ root_ca_dir }}/private/ca.key.pem"
+      no_log: true
+
+    - name: Proteger private key Root CA
+      ansible.builtin.file:
+        path: "{{ root_ca_dir }}/private/ca.key.pem"
+        owner: root
+        group: root
+        mode: "0400"
+
+
+    # ==========================================================
+    # ROOT CERTIFICATE
+    # ==========================================================
+
+    - name: Crear certificado Root CA
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -config
+          - "{{ root_ca_dir }}/openssl.cnf"
+          - -key
+          - "{{ root_ca_dir }}/private/ca.key.pem"
+          - -passin
+          - "pass:{{ root_ca_passphrase }}"
+          - -new
+          - -x509
+          - -days
+          - "{{ root_ca_days | string }}"
+          - -sha256
+          - -extensions
+          - v3_ca
+          - -out
+          - "{{ root_ca_dir }}/certs/ca.cert.pem"
+        creates: "{{ root_ca_dir }}/certs/ca.cert.pem"
+      no_log: true
+
+
+    # ==========================================================
+    # CONFIGURACION INTERMEDIATE CA
+    # ==========================================================
+
+    - name: Crear configuracion Intermediate CA
+      ansible.builtin.copy:
+        dest: "{{ intermediate_ca_dir }}/openssl.cnf"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          [ ca ]
+
+          default_ca = CA_default
+
+
+          [ CA_default ]
+
+          dir = {{ intermediate_ca_dir }}
+
+          certs             = $dir/certs
+          crl_dir           = $dir/crl
+          new_certs_dir     = $dir/newcerts
+
+          database          = $dir/index.txt
+          serial            = $dir/serial
+          crlnumber         = $dir/crlnumber
+
+          certificate       = $dir/certs/intermediate.cert.pem
+          private_key       = $dir/private/intermediate.key.pem
+
+          default_md        = sha256
+
+          default_days      = {{ certificate_days }}
+          default_crl_days  = {{ crl_days }}
+
+          policy            = policy_loose
+
+          unique_subject    = no
+
+          copy_extensions   = copy
+
+
+          [ policy_loose ]
+
+          countryName             = optional
+          stateOrProvinceName     = optional
+          localityName            = optional
+          organizationName        = optional
+          organizationalUnitName  = optional
+          commonName              = supplied
+
+
+          [ req ]
+
+          default_bits       = {{ intermediate_key_size }}
+
+          distinguished_name = req_distinguished_name
+
+          string_mask = utf8only
+
+          default_md = sha256
+
+          prompt = no
+
+
+          [ req_distinguished_name ]
+
+          C  = {{ country }}
+          ST = {{ state }}
+          L  = {{ locality }}
+          O  = {{ organization }}
+          OU = PKI
+
+          CN = {{ intermediate_ca_common_name }}
+
+
+          # ====================================================
+          # SERVIDORES WEB / TLS
+          # ====================================================
+
+          [ server_cert ]
+
+          basicConstraints = critical, CA:false
+
+          subjectKeyIdentifier = hash
+
+          authorityKeyIdentifier = keyid,issuer
+
+          keyUsage = critical, digitalSignature, keyEncipherment
+
+          extendedKeyUsage = serverAuth
+
+
+          # ====================================================
+          # CLIENTES
+          # ====================================================
+
+          [ client_cert ]
+
+          basicConstraints = critical, CA:false
+
+          subjectKeyIdentifier = hash
+
+          authorityKeyIdentifier = keyid,issuer
+
+          keyUsage = critical, digitalSignature
+
+          extendedKeyUsage = clientAuth
+
+
+          # ====================================================
+          # SERVICIOS / MTLS
+          # ====================================================
+
+          [ service_cert ]
+
+          basicConstraints = critical, CA:false
+
+          subjectKeyIdentifier = hash
+
+          authorityKeyIdentifier = keyid,issuer
+
+          keyUsage = critical, digitalSignature, keyEncipherment
+
+          extendedKeyUsage = serverAuth, clientAuth
+
+
+    # ==========================================================
+    # INTERMEDIATE KEY
+    # ==========================================================
+
+    - name: Generar private key Intermediate CA
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - genpkey
+          - -algorithm
+          - RSA
+          - -aes-256-cbc
+          - -pass
+          - "pass:{{ intermediate_ca_passphrase }}"
+          - -pkeyopt
+          - "rsa_keygen_bits:{{ intermediate_key_size }}"
+          - -out
+          - "{{ intermediate_ca_dir }}/private/intermediate.key.pem"
+        creates: "{{ intermediate_ca_dir }}/private/intermediate.key.pem"
+      no_log: true
+
+    - name: Proteger private key Intermediate
+      ansible.builtin.file:
+        path: "{{ intermediate_ca_dir }}/private/intermediate.key.pem"
+        owner: root
+        group: root
+        mode: "0400"
+
+
+    # ==========================================================
+    # CSR INTERMEDIATE
+    # ==========================================================
+
+    - name: Generar CSR Intermediate CA
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -config
+          - "{{ intermediate_ca_dir }}/openssl.cnf"
+          - -new
+          - -sha256
+          - -key
+          - "{{ intermediate_ca_dir }}/private/intermediate.key.pem"
+          - -passin
+          - "pass:{{ intermediate_ca_passphrase }}"
+          - -out
+          - "{{ intermediate_ca_dir }}/csr/intermediate.csr.pem"
+        creates: "{{ intermediate_ca_dir }}/csr/intermediate.csr.pem"
+      no_log: true
+
+
+    # ==========================================================
+    # ROOT FIRMA INTERMEDIATE
+    # ==========================================================
+
+    - name: Firmar Intermediate CA con Root CA
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - ca
+          - -batch
+          - -config
+          - "{{ root_ca_dir }}/openssl.cnf"
+          - -extensions
+          - v3_intermediate_ca
+          - -days
+          - "{{ intermediate_ca_days | string }}"
+          - -notext
+          - -md
+          - sha256
+          - -passin
+          - "pass:{{ root_ca_passphrase }}"
+          - -in
+          - "{{ intermediate_ca_dir }}/csr/intermediate.csr.pem"
+          - -out
+          - "{{ intermediate_ca_dir }}/certs/intermediate.cert.pem"
+        creates: "{{ intermediate_ca_dir }}/certs/intermediate.cert.pem"
+      no_log: true
+
+
+    # ==========================================================
+    # CA CHAIN
+    # ==========================================================
+
+    - name: Crear CA Chain
+      ansible.builtin.shell: |
+        cat \
+        {{ intermediate_ca_dir }}/certs/intermediate.cert.pem \
+        {{ root_ca_dir }}/certs/ca.cert.pem \
+        > {{ intermediate_ca_dir }}/certs/ca-chain.cert.pem
+      args:
+        creates: "{{ intermediate_ca_dir }}/certs/ca-chain.cert.pem"
+
+
+    # ==========================================================
+    # GENERAR CRL
+    # ==========================================================
+
+    - name: Generar CRL inicial
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - ca
+          - -config
+          - "{{ intermediate_ca_dir }}/openssl.cnf"
+          - -gencrl
+          - -passin
+          - "pass:{{ intermediate_ca_passphrase }}"
+          - -out
+          - "{{ intermediate_ca_dir }}/crl/intermediate.crl.pem"
+        creates: "{{ intermediate_ca_dir }}/crl/intermediate.crl.pem"
+      no_log: true
+
+
+    # ==========================================================
+    # INSTALAR ROOT CA LOCALMENTE
+    # ==========================================================
+
+    - name: Instalar Root CA en trust store RHEL
+      ansible.builtin.copy:
+        src: "{{ root_ca_dir }}/certs/ca.cert.pem"
+        dest: /etc/pki/ca-trust/source/anchors/ansible-demo-root-ca.pem
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      register: install_ca
+
+    - name: Actualizar trust store
+      ansible.builtin.command:
+        cmd: update-ca-trust
+      when: install_ca.changed
+
+
+    # ==========================================================
+    # VALIDACIONES
+    # ==========================================================
+
+    - name: Validar certificado Root CA
+      ansible.builtin.command:
+        cmd: >
+          openssl x509
+          -in {{ root_ca_dir }}/certs/ca.cert.pem
+          -noout
+          -subject
+          -issuer
+          -dates
+      register: root_ca_info
+      changed_when: false
+
+    - name: Validar cadena Intermediate -> Root
+      ansible.builtin.command:
+        cmd: >
+          openssl verify
+          -CAfile {{ root_ca_dir }}/certs/ca.cert.pem
+          {{ intermediate_ca_dir }}/certs/intermediate.cert.pem
+      register: chain_validation
+      changed_when: false
+
+    - name: Mostrar Root CA
+      ansible.builtin.debug:
+        var: root_ca_info.stdout_lines
+
+    - name: Mostrar validacion cadena
+      ansible.builtin.debug:
+        var: chain_validation.stdout_lines
+
+
+    # ==========================================================
+    # RESULTADO
+    # ==========================================================
+
+    - name: Resumen final
+      ansible.builtin.debug:
+        msg:
+          - "==============================================="
+          - "       PKI ANSIBLE.DEMO.COM CREADA"
+          - "==============================================="
+          - ""
+          - "Dominio:"
+          - "  {{ ca_domain }}"
+          - ""
+          - "Root CA:"
+          - "  {{ root_ca_dir }}/certs/ca.cert.pem"
+          - ""
+          - "Issuing CA:"
+          - "  {{ intermediate_ca_dir }}/certs/intermediate.cert.pem"
+          - ""
+          - "CA Chain:"
+          - "  {{ intermediate_ca_dir }}/certs/ca-chain.cert.pem"
+          - ""
+          - "CRL:"
+          - "  {{ intermediate_ca_dir }}/crl/intermediate.crl.pem"
+          - ""
+          - "Directorio certificados emitidos:"
+          - "  {{ intermediate_ca_dir }}/issued"
+          - ""
+          - "Perfiles disponibles:"
+          - "  server_cert"
+          - "  service_cert"
+          - "  client_cert"
+          - "==============================================="
