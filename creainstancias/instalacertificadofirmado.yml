@@ -1,4 +1,3 @@
-```yaml
 ---
 - name: Instalar certificado firmado en Tomcat
   hosts: tomcat_servers
@@ -359,4 +358,3 @@
         state: restarted
 
         enabled: true
-```
