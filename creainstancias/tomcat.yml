@@ -1,4 +1,3 @@
-```yaml
 ---
 - name: Instalar Tomcat en RHEL 9 y generar CSR para Workflow
   hosts: tomcat_servers
