@@ -404,7 +404,7 @@
           - -out
           - "{{ root_ca_dir }}/private/ca.key.pem"
         creates: "{{ root_ca_dir }}/private/ca.key.pem"
-      no_log: true
+      no_log: false
 
     - name: Proteger private key Root CA
       ansible.builtin.file:
