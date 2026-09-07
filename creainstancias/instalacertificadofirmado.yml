@@ -1,0 +1,362 @@
+```yaml
+---
+- name: Instalar certificado firmado en Tomcat
+  hosts: tomcat_servers
+  become: true
+  gather_facts: true
+
+  vars:
+
+    # ============================================================
+    # PASSWORD KEYSTORE
+    #
+    # Debe venir desde:
+    #
+    # - AAP Credential
+    # - Vault
+    #
+    # Ejemplo:
+    #
+    # vault_tomcat_keystore_password
+    # ============================================================
+
+    tomcat_keystore_password:
+      "{{ vault_tomcat_keystore_password }}"
+
+
+  pre_tasks:
+
+    # ============================================================
+    # VALIDAR DATOS DEL WORKFLOW
+    # ============================================================
+
+    - name: Validar certificado recibido
+      ansible.builtin.assert:
+        that:
+
+          - certificate_signed is defined
+          - certificate_signed | length > 0
+
+          - certificate_ca_chain is defined
+          - certificate_ca_chain | length > 0
+
+          - certificate_target_directory is defined
+
+          - certificate_private_key_path is defined
+
+        fail_msg: |
+          No se recibieron correctamente los
+          artifacts desde el Job 02.
+
+
+  tasks:
+
+    # ============================================================
+    # DEFINIR PATHS
+    # ============================================================
+
+    - name: Definir rutas
+      ansible.builtin.set_fact:
+
+        certificate_file:
+          "{{ certificate_target_directory }}/server.cert.pem"
+
+        chain_file:
+          "{{ certificate_target_directory }}/ca-chain.cert.pem"
+
+        fullchain_file:
+          "{{ certificate_target_directory }}/fullchain.cert.pem"
+
+        pkcs12_file:
+          "{{ certificate_target_directory }}/tomcat.p12"
+
+        server_xml:
+          "/etc/tomcat/server.xml"
+
+
+    # ============================================================
+    # INSTALAR CERTIFICADO
+    # ============================================================
+
+    - name: Copiar certificado firmado
+      ansible.builtin.copy:
+
+        content: "{{ certificate_signed }}"
+
+        dest: "{{ certificate_file }}"
+
+        owner: root
+        group: root
+
+        mode: "0644"
+
+
+    # ============================================================
+    # INSTALAR CA CHAIN
+    # ============================================================
+
+    - name: Copiar CA Chain
+      ansible.builtin.copy:
+
+        content: "{{ certificate_ca_chain }}"
+
+        dest: "{{ chain_file }}"
+
+        owner: root
+        group: root
+
+        mode: "0644"
+
+
+    # ============================================================
+    # GENERAR FULLCHAIN
+    # ============================================================
+
+    - name: Crear fullchain
+      ansible.builtin.shell: |
+        cat "{{ certificate_file }}" \
+            "{{ chain_file }}" \
+            > "{{ fullchain_file }}"
+      args:
+        creates: "{{ fullchain_file }}"
+
+
+    # ============================================================
+    # VALIDAR CLAVE PRIVADA
+    # ============================================================
+
+    - name: Validar private key
+      ansible.builtin.stat:
+        path: "{{ certificate_private_key_path }}"
+      register: private_key
+
+
+    - name: Verificar private key
+      ansible.builtin.assert:
+        that:
+          - private_key.stat.exists
+        fail_msg: |
+          No existe la clave privada:
+
+          {{ certificate_private_key_path }}
+
+
+    # ============================================================
+    # CREAR PKCS12
+    # ============================================================
+
+    - name: Crear PKCS12 para Tomcat
+      ansible.builtin.command:
+
+        argv:
+
+          - openssl
+
+          - pkcs12
+
+          - -export
+
+          - -inkey
+          - "{{ certificate_private_key_path }}"
+
+          - -in
+          - "{{ certificate_file }}"
+
+          - -certfile
+          - "{{ chain_file }}"
+
+          - -name
+          - tomcat
+
+          - -out
+          - "{{ pkcs12_file }}"
+
+          - -passout
+          - "pass:{{ tomcat_keystore_password }}"
+
+      no_log: true
+
+
+    # ============================================================
+    # PERMISOS PKCS12
+    # ============================================================
+
+    - name: Proteger PKCS12
+      ansible.builtin.file:
+
+        path: "{{ pkcs12_file }}"
+
+        owner: root
+        group: tomcat
+
+        mode: "0640"
+
+
+    # ============================================================
+    # RESPALDAR SERVER.XML
+    # ============================================================
+
+    - name: Respaldar server.xml
+      ansible.builtin.copy:
+
+        src: "{{ server_xml }}"
+
+        dest: "{{ server_xml }}.bak"
+
+        remote_src: true
+
+      ignore_errors: true
+
+
+    # ============================================================
+    # CONFIGURAR HTTPS EN TOMCAT
+    # ============================================================
+
+    - name: Configurar conector HTTPS
+      ansible.builtin.blockinfile:
+
+        path: "{{ server_xml }}"
+
+        marker: "<!-- {mark} ANSIBLE HTTPS CONNECTOR -->"
+
+        insertbefore: "</Service>"
+
+        block: |
+
+          <Connector
+              port="{{ certificate_https_port }}"
+              protocol="org.apache.coyote.http11.Http11NioProtocol"
+              SSLEnabled="true"
+              scheme="https"
+              secure="true"
+              maxThreads="200">
+
+              <SSLHostConfig>
+
+                  <Certificate
+
+                      certificateKeystoreFile="{{ pkcs12_file }}"
+                      certificateKeystoreType="PKCS12"
+                      certificateKeystorePassword="{{ tomcat_keystore_password }}" />
+
+              </SSLHostConfig>
+
+          </Connector>
+
+      notify:
+        - restart tomcat
+
+      no_log: true
+
+
+    # ============================================================
+    # FLUSH HANDLERS
+    # ============================================================
+
+    - meta: flush_handlers
+
+
+    # ============================================================
+    # ESPERAR HTTPS
+    # ============================================================
+
+    - name: Esperar puerto HTTPS
+      ansible.builtin.wait_for:
+
+        host: "127.0.0.1"
+
+        port: "{{ certificate_https_port }}"
+
+        timeout: 60
+
+        state: started
+
+
+    # ============================================================
+    # VALIDAR CERTIFICADO PRESENTADO
+    # ============================================================
+
+    - name: Obtener certificado HTTPS
+      ansible.builtin.command:
+        cmd: >
+          openssl s_client
+          -connect 127.0.0.1:{{ certificate_https_port }}
+          -servername {{ certificate_signed_fqdn }}
+          </dev/null
+
+      register: https_validation
+
+      changed_when: false
+
+
+    - name: Validar CN
+      ansible.builtin.assert:
+        that:
+          - certificate_signed_fqdn in https_validation.stdout
+        fail_msg: |
+          El certificado presentado por Tomcat
+          no coincide con el esperado.
+
+
+    # ============================================================
+    # RESULTADO
+    # ============================================================
+
+    - name: Resultado final
+      ansible.builtin.debug:
+
+        msg:
+
+          - "=================================================="
+          - "HTTPS CONFIGURADO CORRECTAMENTE"
+          - "=================================================="
+
+          - ""
+
+          - "FQDN:"
+          - "  {{ certificate_signed_fqdn }}"
+
+          - ""
+
+          - "Certificado:"
+          - "  {{ certificate_file }}"
+
+          - ""
+
+          - "CA Chain:"
+          - "  {{ chain_file }}"
+
+          - ""
+
+          - "PKCS12:"
+          - "  {{ pkcs12_file }}"
+
+          - ""
+
+          - "HTTPS:"
+          - "  https://{{ certificate_signed_fqdn }}:{{ certificate_https_port }}"
+
+          - ""
+
+          - "Servicio:"
+          - "  {{ certificate_service_name }}"
+
+          - ""
+
+          - "Estado:"
+          - "  Certificado instalado correctamente"
+
+          - "=================================================="
+
+
+  handlers:
+
+    - name: restart tomcat
+      ansible.builtin.systemd:
+
+        name: "{{ certificate_service_name }}"
+
+        state: restarted
+
+        enabled: true
+```
