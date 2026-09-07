@@ -1,0 +1,827 @@
+---
+- name: Firmar CSR recibido desde Workflow
+  hosts: ca_servers
+  become: true
+  gather_facts: true
+
+  vars:
+
+    # ============================================================
+    # PKI
+    # Debe coincidir con la CA creada anteriormente
+    # ============================================================
+
+    ca_domain: "ansible.demo.com"
+
+    ca_base_dir: "/etc/pki/ansible-ca"
+
+    root_ca_dir:
+      "{{ ca_base_dir }}/root"
+
+    intermediate_ca_dir:
+      "{{ ca_base_dir }}/intermediate"
+
+    intermediate_ca_config:
+      "{{ intermediate_ca_dir }}/openssl.cnf"
+
+    intermediate_ca_certificate:
+      "{{ intermediate_ca_dir }}/certs/intermediate.cert.pem"
+
+    root_ca_certificate:
+      "{{ root_ca_dir }}/certs/ca.cert.pem"
+
+    ca_chain_certificate:
+      "{{ intermediate_ca_dir }}/certs/ca-chain.cert.pem"
+
+    intermediate_ca_private_key:
+      "{{ intermediate_ca_dir }}/private/intermediate.key.pem"
+
+    # ============================================================
+    # DIRECTORIOS
+    # ============================================================
+
+    ca_request_dir:
+      "{{ intermediate_ca_dir }}/requests"
+
+    ca_issued_dir:
+      "{{ intermediate_ca_dir }}/issued"
+
+    # ============================================================
+    # CERTIFICADO
+    # ============================================================
+
+    certificate_days: 365
+
+    # Perfil existente en openssl.cnf de la Issuing CA
+    certificate_profile: "server_cert"
+
+    # ============================================================
+    # SEGURIDAD
+    #
+    # Esta contraseña NO debe estar escrita directamente aquí.
+    #
+    # Debe llegar desde:
+    #
+    # - Ansible Vault
+    # - AAP Credential
+    # - Extra variable protegida
+    #
+    # Ejemplo:
+    #
+    # vault_intermediate_ca_passphrase
+    # ============================================================
+
+    intermediate_ca_passphrase:
+      "{{ vault_intermediate_ca_passphrase }}"
+
+
+  pre_tasks:
+
+    # ============================================================
+    # VALIDAR VARIABLES RECIBIDAS DEL WORKFLOW
+    # ============================================================
+
+    - name: Validar variables recibidas desde Job 01
+      ansible.builtin.assert:
+        that:
+
+          - certificate_request_csr is defined
+
+          - certificate_request_csr | length > 0
+
+          - certificate_request_fqdn is defined
+
+          - certificate_request_fqdn | length > 0
+
+          - certificate_request_type is defined
+
+          - certificate_request_profile is defined
+
+        fail_msg: |
+          No se recibieron correctamente las variables
+          provenientes del Job anterior.
+
+          Variables esperadas:
+
+          certificate_request_csr
+          certificate_request_fqdn
+          certificate_request_type
+          certificate_request_profile
+
+
+    # ============================================================
+    # VALIDAR TIPO DE CERTIFICADO
+    # ============================================================
+
+    - name: Validar tipo de certificado solicitado
+      ansible.builtin.assert:
+        that:
+
+          - certificate_request_type == "server"
+
+        fail_msg: |
+          Este playbook solamente firma certificados de servidor.
+
+          Tipo recibido:
+
+          {{ certificate_request_type }}
+
+
+    # ============================================================
+    # VALIDAR PERFIL
+    # ============================================================
+
+    - name: Validar perfil solicitado
+      ansible.builtin.assert:
+        that:
+
+          - certificate_request_profile == certificate_profile
+
+        fail_msg: |
+          Perfil de certificado no autorizado.
+
+          Perfil recibido:
+
+          {{ certificate_request_profile }}
+
+          Perfil permitido:
+
+          {{ certificate_profile }}
+
+
+    # ============================================================
+    # VALIDAR DOMINIO
+    #
+    # Evita que esta CA firme accidentalmente certificados
+    # para dominios externos.
+    # ============================================================
+
+    - name: Validar dominio solicitado
+      ansible.builtin.assert:
+        that:
+
+          - >
+            certificate_request_fqdn == ca_domain
+            or
+            certificate_request_fqdn.endswith('.' + ca_domain)
+
+        fail_msg: |
+          Solicitud rechazada.
+
+          La CA solamente puede emitir certificados para:
+
+          {{ ca_domain }}
+
+          FQDN solicitado:
+
+          {{ certificate_request_fqdn }}
+
+
+    # ============================================================
+    # VALIDAR RHEL
+    # ============================================================
+
+    - name: Validar servidor CA
+      ansible.builtin.assert:
+        that:
+
+          - ansible_distribution == "RedHat"
+
+          - ansible_distribution_major_version == "10"
+
+        fail_msg: |
+          Este playbook está preparado para la CA
+          instalada en RHEL 10.
+
+
+  tasks:
+
+    # ============================================================
+    # VALIDAR OPENSSL
+    # ============================================================
+
+    - name: Validar OpenSSL instalado
+      ansible.builtin.command:
+        cmd: openssl version
+
+      register: openssl_version
+
+      changed_when: false
+
+
+    - name: Mostrar versión OpenSSL
+      ansible.builtin.debug:
+        var: openssl_version.stdout
+
+
+    # ============================================================
+    # VALIDAR COMPONENTES CA
+    # ============================================================
+
+    - name: Validar archivos requeridos por la Issuing CA
+      ansible.builtin.stat:
+        path: "{{ item }}"
+
+      loop:
+
+        - "{{ intermediate_ca_config }}"
+
+        - "{{ intermediate_ca_certificate }}"
+
+        - "{{ intermediate_ca_private_key }}"
+
+        - "{{ root_ca_certificate }}"
+
+        - "{{ ca_chain_certificate }}"
+
+      register: ca_required_files
+
+
+    - name: Validar infraestructura PKI
+      ansible.builtin.assert:
+        that:
+
+          - item.stat.exists
+
+        fail_msg: |
+          Falta un componente requerido de la PKI:
+
+          {{ item.item }}
+
+      loop: "{{ ca_required_files.results }}"
+
+      loop_control:
+        label: "{{ item.item }}"
+
+
+    # ============================================================
+    # CREAR DIRECTORIOS
+    # ============================================================
+
+    - name: Crear directorio de solicitudes
+      ansible.builtin.file:
+
+        path: "{{ ca_request_dir }}"
+
+        state: directory
+
+        owner: root
+
+        group: root
+
+        mode: "0750"
+
+
+    - name: Crear directorio de certificados emitidos
+      ansible.builtin.file:
+
+        path: "{{ ca_issued_dir }}"
+
+        state: directory
+
+        owner: root
+
+        group: root
+
+        mode: "0750"
+
+
+    # ============================================================
+    # DEFINIR PATHS
+    # ============================================================
+
+    - name: Definir archivos de solicitud y certificado
+      ansible.builtin.set_fact:
+
+        received_csr_path:
+          "{{ ca_request_dir }}/{{ certificate_request_fqdn }}.csr.pem"
+
+        issued_certificate_path:
+          "{{ ca_issued_dir }}/{{ certificate_request_fqdn }}.cert.pem"
+
+
+    # ============================================================
+    # GUARDAR CSR RECIBIDO
+    # ============================================================
+
+    - name: Guardar CSR recibido desde Workflow
+      ansible.builtin.copy:
+
+        content: "{{ certificate_request_csr }}"
+
+        dest: "{{ received_csr_path }}"
+
+        owner: root
+
+        group: root
+
+        mode: "0644"
+
+
+    # ============================================================
+    # VALIDAR CSR
+    # ============================================================
+
+    - name: Validar integridad criptográfica del CSR
+      ansible.builtin.command:
+
+        argv:
+
+          - openssl
+
+          - req
+
+          - -in
+
+          - "{{ received_csr_path }}"
+
+          - -noout
+
+          - -verify
+
+      register: csr_verify
+
+      changed_when: false
+
+
+    # ============================================================
+    # OBTENER SUBJECT
+    # ============================================================
+
+    - name: Obtener Subject del CSR
+      ansible.builtin.command:
+
+        argv:
+
+          - openssl
+
+          - req
+
+          - -in
+
+          - "{{ received_csr_path }}"
+
+          - -noout
+
+          - -subject
+
+          - -nameopt
+
+          - RFC2253
+
+      register: csr_subject
+
+      changed_when: false
+
+
+    - name: Mostrar Subject recibido
+      ansible.builtin.debug:
+        var: csr_subject.stdout
+
+
+    # ============================================================
+    # VALIDAR COMMON NAME
+    # ============================================================
+
+    - name: Validar Common Name del CSR
+      ansible.builtin.assert:
+
+        that:
+
+          - >
+            ('CN=' + certificate_request_fqdn)
+            in csr_subject.stdout
+
+        fail_msg: |
+          El Common Name del CSR no coincide
+          con el hostname esperado.
+
+          FQDN esperado:
+
+          {{ certificate_request_fqdn }}
+
+          Subject recibido:
+
+          {{ csr_subject.stdout }}
+
+
+    # ============================================================
+    # OBTENER CSR COMPLETO
+    # ============================================================
+
+    - name: Obtener detalles del CSR
+      ansible.builtin.command:
+
+        argv:
+
+          - openssl
+
+          - req
+
+          - -in
+
+          - "{{ received_csr_path }}"
+
+          - -noout
+
+          - -text
+
+      register: csr_details
+
+      changed_when: false
+
+
+    # ============================================================
+    # VALIDAR SAN PRINCIPAL
+    #
+    # El CSR debe contener el FQDN solicitado.
+    # ============================================================
+
+    - name: Validar SAN principal
+      ansible.builtin.assert:
+
+        that:
+
+          - >
+            ('DNS:' + certificate_request_fqdn)
+            in csr_details.stdout
+
+        fail_msg: |
+          El CSR no contiene el FQDN esperado
+          dentro de Subject Alternative Name.
+
+          SAN requerido:
+
+          DNS:{{ certificate_request_fqdn }}
+
+
+    # ============================================================
+    # VERIFICAR SI YA EXISTE CERTIFICADO
+    # ============================================================
+
+    - name: Verificar certificado existente
+      ansible.builtin.stat:
+
+        path: "{{ issued_certificate_path }}"
+
+      register: existing_certificate
+
+
+    # ============================================================
+    # FIRMA DEL CSR
+    #
+    # Usa la Issuing CA.
+    #
+    # La Root CA NO participa directamente
+    # en la emisión del certificado.
+    # ============================================================
+
+    - name: Firmar CSR con Issuing CA
+      ansible.builtin.command:
+
+        argv:
+
+          - openssl
+
+          - ca
+
+          - -batch
+
+          - -config
+
+          - "{{ intermediate_ca_config }}"
+
+          - -extensions
+
+          - "{{ certificate_profile }}"
+
+          - -days
+
+          - "{{ certificate_days | string }}"
+
+          - -notext
+
+          - -md
+
+          - sha256
+
+          - -passin
+
+          - "pass:{{ intermediate_ca_passphrase }}"
+
+          - -in
+
+          - "{{ received_csr_path }}"
+
+          - -out
+
+          - "{{ issued_certificate_path }}"
+
+      when:
+        - not existing_certificate.stat.exists
+
+      no_log: true
+
+
+    # ============================================================
+    # PERMISOS CERTIFICADO
+    # ============================================================
+
+    - name: Configurar permisos certificado emitido
+      ansible.builtin.file:
+
+        path: "{{ issued_certificate_path }}"
+
+        owner: root
+
+        group: root
+
+        mode: "0644"
+
+
+    # ============================================================
+    # VALIDAR CERTIFICADO
+    # ============================================================
+
+    - name: Validar certificado contra Issuing CA
+      ansible.builtin.command:
+
+        argv:
+
+          - openssl
+
+          - verify
+
+          - -CAfile
+
+          - "{{ ca_chain_certificate }}"
+
+          - "{{ issued_certificate_path }}"
+
+      register: certificate_validation
+
+      changed_when: false
+
+
+    - name: Validar resultado de cadena
+      ansible.builtin.assert:
+
+        that:
+
+          - "'OK' in certificate_validation.stdout"
+
+        fail_msg: |
+          El certificado generado no pasó
+          la validación de cadena.
+
+
+    # ============================================================
+    # OBTENER DATOS CERTIFICADO
+    # ============================================================
+
+    - name: Obtener información del certificado emitido
+      ansible.builtin.command:
+
+        argv:
+
+          - openssl
+
+          - x509
+
+          - -in
+
+          - "{{ issued_certificate_path }}"
+
+          - -noout
+
+          - -subject
+
+          - -issuer
+
+          - -serial
+
+          - -dates
+
+      register: issued_certificate_information
+
+      changed_when: false
+
+
+    - name: Mostrar información del certificado
+      ansible.builtin.debug:
+        var: issued_certificate_information.stdout_lines
+
+
+    # ============================================================
+    # VERIFICAR SAN DEL CERTIFICADO EMITIDO
+    # ============================================================
+
+    - name: Obtener SAN del certificado emitido
+      ansible.builtin.command:
+
+        argv:
+
+          - openssl
+
+          - x509
+
+          - -in
+
+          - "{{ issued_certificate_path }}"
+
+          - -noout
+
+          - -ext
+
+          - subjectAltName
+
+      register: certificate_san
+
+      changed_when: false
+
+
+    - name: Validar SAN del certificado final
+      ansible.builtin.assert:
+
+        that:
+
+          - >
+            ('DNS:' + certificate_request_fqdn)
+            in certificate_san.stdout
+
+        fail_msg: |
+          El certificado firmado no contiene
+          el SAN esperado:
+
+          DNS:{{ certificate_request_fqdn }}
+
+
+    # ============================================================
+    # LEER CERTIFICADO
+    # ============================================================
+
+    - name: Leer certificado firmado
+      ansible.builtin.slurp:
+
+        src: "{{ issued_certificate_path }}"
+
+      register: signed_certificate_file
+
+
+    # ============================================================
+    # LEER INTERMEDIATE
+    # ============================================================
+
+    - name: Leer certificado Intermediate CA
+      ansible.builtin.slurp:
+
+        src: "{{ intermediate_ca_certificate }}"
+
+      register: intermediate_certificate_file
+
+
+    # ============================================================
+    # LEER ROOT
+    # ============================================================
+
+    - name: Leer Root CA
+      ansible.builtin.slurp:
+
+        src: "{{ root_ca_certificate }}"
+
+      register: root_certificate_file
+
+
+    # ============================================================
+    # LEER CA CHAIN
+    # ============================================================
+
+    - name: Leer CA Chain
+      ansible.builtin.slurp:
+
+        src: "{{ ca_chain_certificate }}"
+
+      register: ca_chain_file
+
+
+    # ============================================================
+    # PUBLICAR ARTIFACTS PARA SIGUIENTE JOB
+    #
+    # Estos valores quedarán disponibles para
+    # Job 03 del Workflow.
+    # ============================================================
+
+    - name: Publicar certificado firmado para siguiente Job
+      ansible.builtin.set_stats:
+
+        data:
+
+          certificate_signed_fqdn:
+            "{{ certificate_request_fqdn }}"
+
+          certificate_signed_type:
+            "{{ certificate_request_type }}"
+
+          certificate_signed_profile:
+            "{{ certificate_request_profile }}"
+
+          certificate_signed:
+            "{{ signed_certificate_file.content | b64decode }}"
+
+          certificate_intermediate:
+            "{{ intermediate_certificate_file.content | b64decode }}"
+
+          certificate_root_ca:
+            "{{ root_certificate_file.content | b64decode }}"
+
+          certificate_ca_chain:
+            "{{ ca_chain_file.content | b64decode }}"
+
+          certificate_target_host:
+            "{{ certificate_request_target_host }}"
+
+          certificate_private_key_path:
+            "{{ certificate_request_private_key_path }}"
+
+          certificate_target_directory:
+            "{{ certificate_request_certificate_dir }}"
+
+          certificate_https_port:
+            "{{ certificate_request_https_port }}"
+
+          certificate_service_name:
+            "{{ certificate_request_service_name }}"
+
+        per_host: false
+
+
+    # ============================================================
+    # RESULTADO FINAL
+    # ============================================================
+
+    - name: Mostrar resultado
+      ansible.builtin.debug:
+
+        msg:
+
+          - "=========================================================="
+          - "          CERTIFICADO FIRMADO CORRECTAMENTE"
+          - "=========================================================="
+
+          - ""
+
+          - "FQDN:"
+          - "  {{ certificate_request_fqdn }}"
+
+          - ""
+
+          - "CSR recibido:"
+          - "  {{ received_csr_path }}"
+
+          - ""
+
+          - "Certificado generado:"
+          - "  {{ issued_certificate_path }}"
+
+          - ""
+
+          - "Perfil utilizado:"
+          - "  {{ certificate_profile }}"
+
+          - ""
+
+          - "Validez:"
+          - "  {{ certificate_days }} días"
+
+          - ""
+
+          - "CA:"
+          - "  Ansible Demo Issuing CA"
+
+          - ""
+
+          - "Validación:"
+          - "  {{ certificate_validation.stdout }}"
+
+          - ""
+
+          - "Artifacts publicados al Workflow:"
+
+          - "  certificate_signed"
+          - "  certificate_intermediate"
+          - "  certificate_root_ca"
+          - "  certificate_ca_chain"
+
+          - ""
+
+          - "SIGUIENTE PASO:"
+
+          - "Instalar certificado en:"
+          - "  {{ certificate_request_fqdn }}"
+
+          - ""
+
+          - "Configurar HTTPS:"
+          - "  {{ certificate_request_https_port }}"
+
+          - "=========================================================="
