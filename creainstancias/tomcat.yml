@@ -1,5 +1,5 @@
 ---
-- name: Instalar Tomcat en RHEL 9 y generar CSR para Workflow
+- name: Instalar Tomcat en RHEL 10 y generar CSR para Workflow
   hosts: tomcat_servers
   become: true
   gather_facts: true
@@ -21,10 +21,11 @@
     tomcat_http_port: 8080
     tomcat_https_port: 8443
 
+    # RHEL 10 incluye Tomcat 9 en AppStream
     tomcat_packages:
-      - tomcat
-      - tomcat-webapps
-      - java-17-openjdk-headless
+      - tomcat9
+      - tomcat9-webapps
+      - java-21-openjdk-headless
       - openssl
       - ca-certificates
 
@@ -70,7 +71,7 @@
     # VALIDAR SISTEMA OPERATIVO
     # ============================================================
 
-    - name: Validar que el servidor sea Red Hat Enterprise Linux
+    - name: Validar Red Hat Enterprise Linux
       ansible.builtin.assert:
         that:
           - ansible_distribution == "RedHat"
@@ -80,12 +81,12 @@
           {{ ansible_distribution }}
           {{ ansible_distribution_version }}
 
-    - name: Validar que el servidor tenga RHEL 9
+    - name: Validar RHEL 10
       ansible.builtin.assert:
         that:
-          - ansible_distribution_major_version == "9"
+          - ansible_distribution_major_version == "10"
         fail_msg: >
-          Este playbook está diseñado para RHEL 9.
+          Este playbook está diseñado para RHEL 10.
           Versión detectada:
           {{ ansible_distribution_version }}
 
@@ -101,18 +102,23 @@
     # CONFIGURAR HOSTNAME
     # ============================================================
 
-    - name: Configurar hostname del servidor
+    - name: Configurar hostname
       ansible.builtin.hostname:
         name: "{{ tomcat_fqdn }}"
 
 
     # ============================================================
-    # VALIDAR REPOSITORIOS RHEL 9
+    # VALIDAR REPOSITORIOS
     #
-    # En AWS las imágenes oficiales normalmente utilizan RHUI.
+    # En AWS las imágenes RHEL suelen utilizar RHUI.
+    #
     # No se fuerza subscription-manager.
     #
-    # Se valida que BaseOS y AppStream estén disponibles.
+    # Se valida que existan:
+    #
+    # BaseOS
+    # AppStream
+    #
     # ============================================================
 
     - name: Obtener repositorios habilitados
@@ -139,8 +145,8 @@
         fail_msg: |
           No se encontró un repositorio BaseOS habilitado.
 
-          En una instancia RHEL 9 oficial sobre AWS debería existir
-          un repositorio RHUI equivalente a BaseOS.
+          En una instancia RHEL 10 sobre AWS debería existir
+          un repositorio RHUI correspondiente a BaseOS.
 
           Revise con:
 
@@ -160,7 +166,8 @@
         fail_msg: |
           No se encontró un repositorio AppStream habilitado.
 
-          Tomcat requiere contenido proveniente de AppStream.
+          Tomcat 9 y OpenJDK requieren contenido disponible
+          desde AppStream.
 
           Revise con:
 
@@ -168,12 +175,36 @@
 
 
     # ============================================================
-    # LIMPIAR CACHE DNF
+    # ACTUALIZAR CACHE DNF
     # ============================================================
 
-    - name: Actualizar metadata de repositorios
+    - name: Actualizar metadata DNF
       ansible.builtin.dnf:
         update_cache: true
+
+
+    # ============================================================
+    # VALIDAR DISPONIBILIDAD DE TOMCAT
+    # ============================================================
+
+    - name: Validar disponibilidad del paquete Tomcat
+      ansible.builtin.command:
+        cmd: dnf list available tomcat9
+      register: tomcat_available
+      changed_when: false
+      failed_when: false
+
+    - name: Validar que Tomcat esté disponible
+      ansible.builtin.assert:
+        that:
+          - tomcat_available.rc == 0
+        fail_msg: |
+          El paquete tomcat9 no está disponible.
+
+          Verifique que AppStream esté correctamente habilitado:
+
+          dnf repolist
+          dnf list available tomcat9
 
 
     # ============================================================
@@ -202,12 +233,12 @@
 
 
     # ============================================================
-    # VALIDAR TOMCAT INSTALADO
+    # VALIDAR TOMCAT
     # ============================================================
 
     - name: Obtener versión instalada de Tomcat
       ansible.builtin.command:
-        cmd: rpm -q tomcat
+        cmd: rpm -q tomcat9
       register: tomcat_version
       changed_when: false
 
@@ -217,30 +248,64 @@
 
 
     # ============================================================
-    # HABILITAR E INICIAR TOMCAT
+    # IDENTIFICAR SERVICIO SYSTEMD DE TOMCAT
     # ============================================================
 
-    - name: Habilitar Tomcat al inicio
-      ansible.builtin.systemd:
-        name: tomcat
-        enabled: true
+    - name: Buscar servicio Tomcat instalado
+      ansible.builtin.shell: |
+        set -o pipefail
 
-    - name: Iniciar servicio Tomcat
+        systemctl list-unit-files \
+          --type=service \
+          --no-legend |
+        awk '{print $1}' |
+        grep -E '^tomcat.*\.service$' |
+        head -1
+      args:
+        executable: /bin/bash
+      register: tomcat_service_detect
+      changed_when: false
+
+    - name: Validar servicio Tomcat
+      ansible.builtin.assert:
+        that:
+          - tomcat_service_detect.stdout | length > 0
+        fail_msg: >
+          No fue posible identificar el servicio systemd
+          correspondiente a Tomcat.
+
+    - name: Definir nombre servicio Tomcat
+      ansible.builtin.set_fact:
+        tomcat_service_name:
+          "{{ tomcat_service_detect.stdout | regex_replace('\\.service$', '') }}"
+
+    - name: Mostrar servicio Tomcat detectado
+      ansible.builtin.debug:
+        msg:
+          - "Servicio Tomcat: {{ tomcat_service_name }}"
+
+
+    # ============================================================
+    # HABILITAR TOMCAT
+    # ============================================================
+
+    - name: Habilitar e iniciar Tomcat
       ansible.builtin.systemd:
-        name: tomcat
+        name: "{{ tomcat_service_name }}"
+        enabled: true
         state: started
 
 
     # ============================================================
-    # VALIDAR SERVICIO SYSTEMD
+    # VALIDAR SERVICIO
     # ============================================================
 
-    - name: Obtener estado de Tomcat
+    - name: Obtener estado Tomcat
       ansible.builtin.systemd:
-        name: tomcat
+        name: "{{ tomcat_service_name }}"
       register: tomcat_service
 
-    - name: Validar que Tomcat esté ejecutándose
+    - name: Validar Tomcat activo
       ansible.builtin.assert:
         that:
           - tomcat_service.status.ActiveState == "active"
@@ -249,14 +314,18 @@
 
 
     # ============================================================
-    # VALIDAR PUERTO LOCAL TOMCAT
+    # ESPERAR PUERTO TOMCAT
     #
-    # No se administra firewall.
-    # El acceso externo debe ser controlado mediante AWS
-    # Security Groups / NACL.
+    # NO se administra firewalld.
+    #
+    # El tráfico externo debe controlarse mediante:
+    #
+    # AWS Security Groups
+    # AWS NACL
+    #
     # ============================================================
 
-    - name: Esperar que Tomcat escuche en el puerto HTTP
+    - name: Esperar puerto HTTP de Tomcat
       ansible.builtin.wait_for:
         host: "127.0.0.1"
         port: "{{ tomcat_http_port }}"
@@ -265,80 +334,127 @@
 
 
     # ============================================================
-    # VALIDAR TOMCAT POR HTTP LOCAL
+    # VALIDAR HTTP LOCAL
     # ============================================================
 
-    - name: Validar respuesta HTTP de Tomcat
+    - name: Validar Tomcat mediante HTTP
       ansible.builtin.uri:
         url: "http://127.0.0.1:{{ tomcat_http_port }}/"
         method: GET
         return_content: false
+
         status_code:
           - 200
           - 302
           - 403
+
       register: tomcat_http_test
+
       retries: 10
       delay: 3
-      until: tomcat_http_test.status in [200, 302, 403]
+
+      until:
+        tomcat_http_test.status in [200, 302, 403]
 
 
     # ============================================================
     # CREAR DIRECTORIO PKI
     # ============================================================
 
-    - name: Crear directorio para certificados Tomcat
+    - name: Crear directorio PKI Tomcat
       ansible.builtin.file:
         path: "{{ certificate_dir }}"
         state: directory
         owner: root
-        group: tomcat
+        group: root
         mode: "0750"
 
 
     # ============================================================
-    # GENERAR CLAVE PRIVADA
-    #
-    # La clave privada nunca debe salir del servidor Tomcat.
+    # IDENTIFICAR GRUPO TOMCAT
     # ============================================================
 
-    - name: Generar clave privada RSA para Tomcat
+    - name: Obtener grupo Tomcat
+      ansible.builtin.command:
+        cmd: getent group tomcat
+      register: tomcat_group
+      failed_when: false
+      changed_when: false
+
+    - name: Definir grupo para certificados
+      ansible.builtin.set_fact:
+        tomcat_certificate_group:
+          "{{ 'tomcat' if tomcat_group.rc == 0 else 'root' }}"
+
+
+    # ============================================================
+    # AJUSTAR DIRECTORIO PKI
+    # ============================================================
+
+    - name: Configurar permisos directorio PKI
+      ansible.builtin.file:
+        path: "{{ certificate_dir }}"
+        owner: root
+        group: "{{ tomcat_certificate_group }}"
+        mode: "0750"
+
+
+    # ============================================================
+    # GENERAR PRIVATE KEY
+    #
+    # IMPORTANTE:
+    #
+    # Esta clave permanece exclusivamente en el servidor Tomcat.
+    #
+    # Nunca se envía a la CA.
+    #
+    # ============================================================
+
+    - name: Generar clave privada RSA
       ansible.builtin.command:
         argv:
+
           - openssl
           - genpkey
+
           - -algorithm
           - RSA
+
           - -pkeyopt
           - "rsa_keygen_bits:{{ certificate_key_size }}"
+
           - -out
           - "{{ certificate_private_key }}"
+
       args:
         creates: "{{ certificate_private_key }}"
 
 
     # ============================================================
-    # PROTEGER CLAVE PRIVADA
+    # PERMISOS PRIVATE KEY
     # ============================================================
 
-    - name: Configurar permisos de la clave privada
+    - name: Proteger clave privada
       ansible.builtin.file:
         path: "{{ certificate_private_key }}"
         owner: root
-        group: tomcat
+        group: "{{ tomcat_certificate_group }}"
         mode: "0640"
 
 
     # ============================================================
-    # CREAR CONFIGURACIÓN OPENSSL PARA CSR
+    # CONFIGURACION OPENSSL
     # ============================================================
 
-    - name: Crear configuración OpenSSL para CSR
+    - name: Crear configuración CSR
       ansible.builtin.copy:
+
         dest: "{{ certificate_config }}"
+
         owner: root
         group: root
         mode: "0644"
+
         content: |
           [ req ]
 
@@ -390,28 +506,35 @@
     # GENERAR CSR
     # ============================================================
 
-    - name: Generar CSR para Tomcat
+    - name: Generar CSR Tomcat
       ansible.builtin.command:
         argv:
+
           - openssl
           - req
+
           - -new
+
           - -sha256
+
           - -key
           - "{{ certificate_private_key }}"
+
           - -config
           - "{{ certificate_config }}"
+
           - -out
           - "{{ certificate_csr }}"
+
       args:
         creates: "{{ certificate_csr }}"
 
 
     # ============================================================
-    # CONFIGURAR PERMISOS CSR
+    # PERMISOS CSR
     # ============================================================
 
-    - name: Configurar permisos del CSR
+    - name: Configurar permisos CSR
       ansible.builtin.file:
         path: "{{ certificate_csr }}"
         owner: root
@@ -423,61 +546,73 @@
     # VALIDAR CSR
     # ============================================================
 
-    - name: Validar integridad del CSR
+    - name: Validar integridad CSR
       ansible.builtin.command:
         argv:
+
           - openssl
           - req
+
           - -in
           - "{{ certificate_csr }}"
+
           - -noout
+
           - -verify
+
       register: csr_verify
+
       changed_when: false
 
 
     # ============================================================
-    # OBTENER SUBJECT DEL CSR
+    # OBTENER SUBJECT
     # ============================================================
 
-    - name: Obtener Subject del CSR
+    - name: Obtener Subject CSR
       ansible.builtin.command:
         argv:
+
           - openssl
           - req
+
           - -in
           - "{{ certificate_csr }}"
+
           - -noout
+
           - -subject
+
       register: csr_subject
+
       changed_when: false
 
 
     # ============================================================
-    # MOSTRAR SAN DEL CSR
+    # OBTENER INFORMACION CSR
     # ============================================================
 
-    - name: Obtener SAN del CSR
-      ansible.builtin.shell: |
-        set -o pipefail
+    - name: Obtener información CSR
+      ansible.builtin.command:
+        argv:
 
-        openssl req \
-          -in "{{ certificate_csr }}" \
-          -noout \
-          -text |
-        grep -A1 "Subject Alternative Name"
-      args:
-        executable: /bin/bash
-      register: csr_san
+          - openssl
+          - req
+
+          - -in
+          - "{{ certificate_csr }}"
+
+          - -noout
+
+          - -text
+
+      register: csr_information
+
       changed_when: false
-      failed_when: false
 
 
     # ============================================================
     # LEER CSR
-    #
-    # Slurp lo lee en Base64.
-    # Posteriormente lo convertimos nuevamente a PEM.
     # ============================================================
 
     - name: Leer CSR generado
@@ -487,14 +622,18 @@
 
 
     # ============================================================
-    # CREAR VARIABLES PARA EL SIGUIENTE JOB DEL WORKFLOW
+    # PUBLICAR VARIABLES PARA AAP WORKFLOW
     #
-    # AAP puede utilizar los valores publicados mediante
-    # set_stats en el siguiente nodo del Workflow.
+    # El CSR se transforma nuevamente desde Base64 a formato PEM.
+    #
+    # Estas variables estarán disponibles para el siguiente
+    # Job Template del Workflow.
+    #
     # ============================================================
 
-    - name: Publicar CSR como artifact del Workflow
+    - name: Publicar CSR para siguiente Job Template
       ansible.builtin.set_stats:
+
         data:
 
           certificate_request_fqdn:
@@ -524,8 +663,14 @@
           certificate_request_certificate_dir:
             "{{ certificate_dir }}"
 
+          certificate_request_http_port:
+            "{{ tomcat_http_port }}"
+
           certificate_request_https_port:
             "{{ tomcat_https_port }}"
+
+          certificate_request_service_name:
+            "{{ tomcat_service_name }}"
 
         per_host: false
 
@@ -536,47 +681,93 @@
 
     - name: Mostrar resultado final
       ansible.builtin.debug:
+
         msg:
-          - "======================================================"
-          - "              TOMCAT INSTALADO"
-          - "======================================================"
+
+          - "=========================================================="
+          - "        TOMCAT RHEL 10 INSTALADO CORRECTAMENTE"
+          - "=========================================================="
+
           - ""
+
+          - "Sistema:"
+          - "  {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+          - ""
+
           - "Servidor:"
           - "  {{ tomcat_fqdn }}"
+
           - ""
+
           - "Tomcat:"
           - "  {{ tomcat_version.stdout }}"
+
           - ""
+
+          - "Servicio:"
+          - "  {{ tomcat_service_name }}"
+
+          - ""
+
+          - "Java:"
+          - "  OpenJDK 21"
+
+          - ""
+
           - "HTTP local:"
           - "  http://127.0.0.1:{{ tomcat_http_port }}"
+
           - ""
-          - "HTTP externo esperado:"
+
+          - "HTTP externo:"
           - "  http://{{ tomcat_fqdn }}:{{ tomcat_http_port }}"
+
           - ""
+
           - "Clave privada:"
           - "  {{ certificate_private_key }}"
+
           - ""
+
           - "CSR:"
           - "  {{ certificate_csr }}"
+
           - ""
+
           - "Subject:"
           - "  {{ csr_subject.stdout }}"
+
           - ""
-          - "Validación CSR:"
-          - "  {{ csr_verify.stderr | default(csr_verify.stdout) }}"
+
+          - "CSR verificado:"
+          - "  OK"
+
           - ""
-          - "CSR publicado al Workflow mediante:"
+
+          - "Artifact AAP:"
           - "  certificate_request_csr"
+
           - ""
-          - "FQDN publicado:"
-          - "  certificate_request_fqdn"
+
+          - "Perfil certificado:"
+          - "  server_cert"
+
           - ""
-          - "Perfil solicitado:"
-          - "  certificate_request_profile = server_cert"
+
+          - "La clave privada permanece en:"
+          - "  {{ tomcat_fqdn }}"
+
           - ""
+
           - "La clave privada NO se envía a la CA."
+
           - ""
-          - "SIGUIENTE PASO:"
-          - "Firmar el CSR usando la Issuing CA"
-          - "de ansible.demo.com."
-          - "======================================================"
+
+          - "SIGUIENTE PASO DEL WORKFLOW:"
+
+          - "  Firmar CSR utilizando"
+          - "  Ansible Demo Issuing CA"
+
+          - "=========================================================="
+
